@@ -4,6 +4,8 @@ import xarray as xr
 import subprocess
 import os
 import matplotlib.pyplot as plt
+import time
+import sys
 from bayes_opt import BayesianOptimization
 from bayes_opt import acquisition
 from sklearn.gaussian_process.kernels import Matern
@@ -15,12 +17,8 @@ from io import BytesIO
 # suppress warnings about this being an experimental feature
 warnings.filterwarnings(action="ignore")
 
-simulation_list = ["SPR-045"]
+simulation_list = ["r1","r2","r3","r4"]
 KY_RANGE = np.arange(0.01, 1, 0.01)
-
-TGLF_FIles_Directory = "/home/felix/Documents/Physics_Work/Project_Codes/Bayesian_Files/TGLF/Simulations"
-GS2_Files_Directory = "/home/felix/Documents/Physics_Work/Project_Codes/Bayesian_Files/TGLF/Simulations"
-
 
 def generate_tglf_files(template_path, params_to_update, ky_range):
     """
@@ -41,7 +39,6 @@ def generate_tglf_files(template_path, params_to_update, ky_range):
         template_lines = template_file.readlines()
 
     param_dir = "_".join([f"{key}{value}" for key, value in params_to_update.items() if key != "KY"])
-    os.makedirs(param_dir, exist_ok=True)
 
     for ky in ky_range:
         # Update KY value for this scan
@@ -86,6 +83,57 @@ def run_tglf_on_files(simulation,params_to_update):
         print(f"Running tglf on {file}")
         # Run the TGLF command using subprocess
         subprocess.run(["tglf", "-e", file], check=True)
+
+def run_tglf_on_files_Compute(simulation, params_to_update):
+    """
+    Submit TGLF jobs to a Slurm cluster using sbatch and wait for completion.
+
+    Args:
+        simulation (str): Name of the simulation.
+        params_to_update (dict): Dictionary of parameters to update with their new values.
+    """
+    param_dir = "_".join([f"{key}{value}" for key, value in params_to_update.items() if key != "KY"])
+    directory = os.path.join("TGLF/Simulations", simulation, param_dir)
+
+    # Create a directory for SLURM logs
+    slurm_logs_dir = os.path.join(directory, "slurm_logs")
+    os.makedirs(slurm_logs_dir, exist_ok=True)
+
+    # List all input files in the directory matching the pattern
+    input_files = [os.path.join(directory, file) for file in os.listdir(directory) if file.startswith("ky_")]
+
+    job_ids = []  # List to store submitted job IDs
+
+    for file in input_files:
+        print(f"Submitting tglf job for {file}")
+
+        # Create a Slurm job script
+        job_script = f"""#!/bin/bash
+#SBATCH --time=00:30:00
+#SBATCH --partition=nodes
+#SBATCH --nodes=2  # Request 4 nodes
+#SBATCH --ntasks-per-node=48  # Adjust based on the number of CPUs per node
+#SBATCH --output={os.path.join(slurm_logs_dir, os.path.basename(file))}.out
+#SBATCH --error={os.path.join(slurm_logs_dir,"e_", os.path.basename(file))}.err
+srun --hint=nomultithread --distribution=block:block -n 96 tglf -e {file}
+"""
+
+        # Write the job script to a temporary file
+        job_script_path = os.path.join(directory, f"job_{os.path.basename(file)}.job")
+
+        # Ensure the file is overwritten if it already exists
+        if os.path.exists(job_script_path):
+            os.remove(job_script_path)
+
+        with open(job_script_path, "w") as script_file:
+            script_file.write(job_script)
+
+        # Submit the job script using sbatch and capture the job ID
+        result = subprocess.run(["sbatch", job_script_path], check=True, capture_output=True, text=True)
+        job_id = result.stdout.strip().split()[-1]  # Extract the job ID from sbatch output
+        job_ids.append(job_id)
+
+    return job_ids
 
 def read_tglf_files(template_path, params_to_update, ky_range):
     """
@@ -151,12 +199,39 @@ def run_TGLF(NBASIS_DIF, NBASIS_MIN, NXGRID, FILTER, WIDTH_DIF, WIDTH_MIN, THETA
         "THETA_TRAPPED": THETA_TRAPPED,
     }
 
+    job_ids = []
     for simulation in simulation_list:
         # Generate TGLF input files
         generate_tglf_files(simulation, params_to_update, KY_RANGE)
 
-        run_tglf_on_files(simulation,params_to_update)
+        job_ids = job_ids + run_tglf_on_files_Compute(simulation,params_to_update)
 
+    # Wait for all jobs to complete
+
+    print("Waiting for all TGLF jobs to complete...")
+    total_jobs = len(job_ids)
+
+    while True:
+        # Check the status of the jobs using squeue
+        result = subprocess.run(["squeue", "--jobs", ",".join(job_ids), "--noheader"], capture_output=True, text=True)
+        job_lines = result.stdout.strip().splitlines()  # Get the list of jobs still in the queue
+        num_jobs_left = len(job_lines)  # Count the number of jobs left
+        num_jobs_completed = total_jobs - num_jobs_left  # Calculate completed jobs
+
+        # Display the loading bar
+        progress = int((num_jobs_completed / total_jobs) * 50)  # Scale progress to 50 characters
+        loading_bar = f"[{'#' * progress}{'.' * (50 - progress)}]"
+        sys.stdout.write(f"\r{loading_bar} {num_jobs_completed}/{total_jobs} jobs completed")
+        sys.stdout.flush()
+
+        if num_jobs_left == 0:  # If no jobs are listed, they are all complete
+            break
+
+        time.sleep(10)  # Wait for 10 seconds before checking again
+
+    print("\nAll TGLF jobs have completed.")
+
+    for simulation in simulation_list:
         TGLF_data.append(read_tglf_files(simulation,params_to_update, KY_RANGE))
 
     return TGLF_data
@@ -175,9 +250,48 @@ def Kernel_1(TGLF,GS2):
     int: Naive Difference between TGLF and GS2
     """
 
+
     difference = np.sum(np.abs(np.array(TGLF)-np.array(GS2)))
 
     return difference
+
+
+def kernel_2(TGLF, GS2, ky_range=None, ky_weights=None):
+    """
+    Calculate the difference in growth rates between TGLF and GS2 for all simulations.
+
+    Args:
+        TGLF (list): 3D array containing TGLF data [frequency, growth_rate] for each simulation and KY value.
+        GS2 (list): 3D array containing GS2 data [frequency, growth_rate] for each simulation and KY value.
+        ky_range (list, optional): List of KY indices to consider. Defaults to all KY values.
+        ky_weights (list, optional): List of weights for each KY value. Defaults to uniform weights.
+
+    Returns:
+        list: List of summed growth rate differences for each simulation.
+    """
+    if ky_range is None:
+        ky_range = range(len(TGLF[0][1]))  # Default to all KY indices
+
+    if ky_weights is None:
+        ky_weights = [1] * len(ky_range)  # Default to uniform weights
+
+    if len(ky_weights) != len(ky_range):
+        raise ValueError("Length of ky_weights must match the length of ky_range.")
+
+    differences = []
+
+    for sim_idx, (tglf_sim, gs2_sim) in enumerate(zip(TGLF, GS2)):
+        growth_rate_diff = 0
+        for ky_idx, weight in zip(ky_range, ky_weights):
+            tglf_growth_rate = tglf_sim[1][ky_idx]
+            gs2_growth_rate = gs2_sim[1][ky_idx]
+            growth_rate_diff += weight * abs(tglf_growth_rate - gs2_growth_rate)
+        differences.append(growth_rate_diff)
+    
+    return np.sum(differences)
+
+
+
 
 
 def Difference_Function(NBASIS_DIF,NBASIS_MIN,NXGRID,FILTER,WIDTH_DIF,WIDTH_MIN,THETA_TRAPPED):
@@ -195,7 +309,7 @@ def Difference_Function(NBASIS_DIF,NBASIS_MIN,NXGRID,FILTER,WIDTH_DIF,WIDTH_MIN,
         "THETA_TRAPPED": THETA_TRAPPED,
     }
     create_pdf_report(TGLF, GS2, params_to_update)
-    return -1*Kernel_1(TGLF,GS2) # returns the negative so the optimizer minimizes its abosulte value
+    return -1*kernel_2(TGLF,GS2) # returns the negative so the optimizer minimizes its abosulte value
 
 
 def plot_comparisons(TGLF_data, GS2_data):
@@ -245,6 +359,41 @@ def plot_comparisons(TGLF_data, GS2_data):
 
     return plots
 
+def plot_comparison_for_simulation(TGLF_sim_data, GS2_sim_data, ky_range):
+    """
+    Generate a comparison plot for a single simulation's TGLF and GS2 data.
+
+    Args:
+        TGLF_sim_data (list): TGLF data [frequency, growth_rate] for a single simulation.
+        GS2_sim_data (list): GS2 data [frequency, growth_rate] for a single simulation.
+        ky_range (list): List of KY values.
+
+    Returns:
+        matplotlib.figure.Figure: A matplotlib Figure object for the simulation.
+    """
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+
+    # Frequency vs KY
+    ax[0].plot(ky_range, TGLF_sim_data[0], label="Frequency TGLF", color="blue")
+    ax[0].plot(ky_range, GS2_sim_data[0], label="Frequency GS2", color="red")
+    ax[0].set_xlabel("KY")
+    ax[0].set_ylabel("Frequency")
+    ax[0].set_title("Frequency vs KY")
+    ax[0].grid(True)
+    ax[0].legend()
+
+    # Growth Rate vs KY
+    ax[1].plot(ky_range, TGLF_sim_data[1], label="Growth Rate TGLF", color="blue")
+    ax[1].plot(ky_range, GS2_sim_data[1], label="Growth Rate GS2", color="red")
+    ax[1].set_xlabel("KY")
+    ax[1].set_ylabel("Growth Rate")
+    ax[1].set_title("Growth Rate vs KY")
+    ax[1].grid(True)
+    ax[1].legend()
+
+    return fig
+
+
 def create_pdf_report(TGLF_data, GS2_data, params):
     """
     Create a PDF report comparing TGLF and GS2 data.
@@ -261,7 +410,10 @@ def create_pdf_report(TGLF_data, GS2_data, params):
     # Ensure the directory exists
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-    plots = plot_comparisons(TGLF_data, GS2_data)  # Assume this returns a list of matplotlib figures
+    plots = []
+    for sim_idx in range(len(TGLF_data)):
+        plot = plot_comparison_for_simulation(TGLF_data[sim_idx], GS2_data[sim_idx], KY_RANGE)
+        plots.append(plot)
 
     with PdfPages(output_file) as pdf:
         # First page: title and parameters
@@ -269,23 +421,29 @@ def create_pdf_report(TGLF_data, GS2_data, params):
         ax.axis('off')
 
         title = "TGLF vs GS2 Comparison Report"
-        ax.text(0.5, 0.95, title, fontsize=16, ha='center', va='top', weight='bold')
+        ax.text(0.5, 0.9, title, fontsize=16, weight='bold', ha='center')
 
-        ax.text(0.0, 0.9, "Simulation Parameters:", fontsize=12, weight='bold')
-        y_pos = 0.88
+        ax.text(0.0, 0.8, "Simulation Parameters:", fontsize=12, weight='bold')
+        y_pos = 0.75
         for key, value in params.items():
-            ax.text(0.05, y_pos, f"- {key}: {value}", fontsize=11, ha='left')
+            ax.text(0.0, y_pos, f"{key}: {value}", fontsize=11, ha='left')
             y_pos -= 0.03
 
-        ax.text(0.0, y_pos, "Kenerl 1 Comparison:", fontsize=12, weight='bold')
-        difference = Kernel_1(TGLF_data,GS2_data)
-        ax.text(0.0, y_pos - 0.03, difference, fontsize=8)
+        ax.text(0.0, y_pos, "Kernel 2 Comparison:", fontsize=12, weight='bold')
+        difference = kernel_2(TGLF_data, GS2_data)
+        ax.text(0.0, y_pos - 0.03, f"Difference: {difference}", fontsize=11)
 
         pdf.savefig(fig)
         plt.close(fig)
 
+
         # Add each plot as a new page
         for plot in plots:
+            # Add a heading for the simulation
+            fig, ax = plt.subplots(figsize=(8.27, 1))  # Small figure for the heading
+            ax.axis('off')
+            simulation_name = simulation_list[sim_idx]
+            ax.text(0.5, 0.5, f"Simulation: {simulation_name}", fontsize=14, weight='bold', ha='center')
             pdf.savefig(plot)
             plt.close(plot)
 
@@ -340,11 +498,55 @@ def create_markdown_report(TGLF_data, GS2_data, params):
 
     print(f"Markdown report saved as {output_file}")
 
+def plot_bayesian_optimization_results(optimizer, output_file="Bayesian_Optimization_Results.pdf"):
+    """
+    Plot the results of the Bayesian optimization process and save them to a PDF.
 
+    Args:
+        optimizer (BayesianOptimization): The BayesianOptimization object after running the optimization.
+        output_file (str): Name of the output PDF file.
+    """
+    # Extract the results
+    iterations = list(range(1, len(optimizer.res) + 1))
+    target_values = [res["target"] for res in optimizer.res]
+
+    # Create a PDF file
+    with PdfPages(output_file) as pdf:
+        # Plot the target values over iterations
+        plt.figure(figsize=(10, 6))
+        plt.plot(iterations, target_values, marker="o", linestyle="-", color="b", label="Target Value")
+        plt.xlabel("Iteration")
+        plt.ylabel("Target Value")
+        plt.title("Bayesian Optimization Results")
+        plt.grid(True)
+        plt.legend()
+        pdf.savefig()  # Save the current figure to the PDF
+        plt.close()
+
+        # Add a summary page with the best result
+        fig, ax = plt.subplots(figsize=(8.27, 11.69))  # A4 size in inches
+        ax.axis('off')
+
+        title = "Bayesian Optimization Summary"
+        ax.text(0.5, 0.9, title, fontsize=16, weight='bold', ha='center')
+
+        best_result = optimizer.max
+        ax.text(0.0, 0.8, "Best Result:", fontsize=12, weight='bold')
+        ax.text(0.0, 0.75, f"Target: {best_result['target']}", fontsize=11)
+        ax.text(0.0, 0.7, "Parameters:", fontsize=12, weight='bold')
+        y_pos = 0.65
+        for key, value in best_result["params"].items():
+            ax.text(0.0, y_pos, f"{key}: {value}", fontsize=11)
+            y_pos -= 0.03
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    print(f"PDF report saved as {output_file}")
 
 def run_optimation():
     # Bounded region of parameter space
-    pbounds = {'NBASIS_DIF': (0, 8,int), 'NBASIS_MIN': (2, 10,int),'NXGRID':(10,100,int),'FILTER':(0,5),'WIDTH_dif':(0,1.9), 'WIDTH_MIN':(0.1,2),'THETA_TRAPPED':(0,1)}
+    pbounds = {'NBASIS_DIF': (0, 8,int), 'NBASIS_MIN': (2, 10,int),'NXGRID':(10,100,int),'FILTER':(0,5),'WIDTH_DIF':(0,1.9), 'WIDTH_MIN':(0.1,2),'THETA_TRAPPED':(0,1)}
 
     # Example: Run the Bayesian optimization process
     optimizer = BayesianOptimization(
@@ -357,6 +559,9 @@ def run_optimation():
         init_points=2,
         n_iter=3,
     )
+
+    # Generate a PDF report with the results
+    plot_bayesian_optimization_results(optimizer, output_file="Bayesian_Optimization_Results.pdf")
 
 
 
