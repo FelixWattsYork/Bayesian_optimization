@@ -6,6 +6,9 @@ import os
 import matplotlib.pyplot as plt
 import time
 import sys
+import itertools
+import seaborn as sns
+import pandas as pd
 from bayes_opt import BayesianOptimization
 from bayes_opt import acquisition
 from sklearn.gaussian_process.kernels import Matern
@@ -17,8 +20,8 @@ from io import BytesIO
 # suppress warnings about this being an experimental feature
 warnings.filterwarnings(action="ignore")
 
-simulation_list = ["r1","r2","r3","r4"]
-KY_RANGE = np.arange(0.01, 1, 0.01)
+simulation_list = ["r1"]
+KY_RANGE = np.arange(0.01, 1, 0.1)
 
 def generate_tglf_files(template_path, params_to_update, ky_range):
     """
@@ -84,7 +87,7 @@ def run_tglf_on_files(simulation,params_to_update):
         # Run the TGLF command using subprocess
         subprocess.run(["tglf", "-e", file], check=True)
 
-def run_tglf_on_files_Compute(simulation, params_to_update):
+def run_tglf_on_files_Compute(simulation, params_to_update,ky_range):
     """
     Submit TGLF jobs to a Slurm cluster using sbatch and wait for completion.
 
@@ -95,17 +98,20 @@ def run_tglf_on_files_Compute(simulation, params_to_update):
     param_dir = "_".join([f"{key}{value}" for key, value in params_to_update.items() if key != "KY"])
     directory = os.path.join("TGLF/Simulations", simulation, param_dir)
 
+
+
     # Create a directory for SLURM logs
     slurm_logs_dir = os.path.join(directory, "slurm_logs")
     os.makedirs(slurm_logs_dir, exist_ok=True)
 
-    # List all input files in the directory matching the pattern
-    input_files = [os.path.join(directory, file) for file in os.listdir(directory) if file.startswith("ky_")]
 
     job_ids = []  # List to store submitted job IDs
 
-    for file in input_files:
-        print(f"Submitting tglf job for {file}")
+    for ky in ky_range:
+        # Create a directory name with key parameters
+        ky_dir = os.path.join(directory, f"ky_{ky:.2f}")
+
+        print(f"Submitting tglf job for {ky_dir}")
 
         # Create a Slurm job script
         job_script = f"""#!/bin/bash
@@ -113,13 +119,15 @@ def run_tglf_on_files_Compute(simulation, params_to_update):
 #SBATCH --partition=nodes
 #SBATCH --nodes=2  # Request 4 nodes
 #SBATCH --ntasks-per-node=48  # Adjust based on the number of CPUs per node
-#SBATCH --output={os.path.join(slurm_logs_dir, os.path.basename(file))}.out
-#SBATCH --error={os.path.join(slurm_logs_dir,"e_", os.path.basename(file))}.err
-srun --hint=nomultithread --distribution=block:block -n 96 tglf -e {file}
+#SBATCH --output={os.path.join(slurm_logs_dir, os.path.basename(ky_dir))}.out
+#SBATCH --error={os.path.join(slurm_logs_dir,"e_", os.path.basename(ky_dir))}.err
+srun --hint=nomultithread --distribution=block:block -n 96 tglf -e {ky_dir} 
 """
+        
+        # can change tglf wrapper to tglf binary
 
         # Write the job script to a temporary file
-        job_script_path = os.path.join(directory, f"job_{os.path.basename(file)}.job")
+        job_script_path = os.path.join(directory, f"job_{os.path.basename(ky_dir)}.job")
 
         # Ensure the file is overwritten if it already exists
         if os.path.exists(job_script_path):
@@ -151,12 +159,11 @@ def read_tglf_files(template_path, params_to_update, ky_range):
     growth_rates = []
 
     for ky in ky_range:
-        ky_dir = os.path.join(output_base_dir,param_dir, f"ky_{ky:.2f}","input.tglf")
-        pyro = Pyro(gk_file=ky_dir,gk_code="TGLF")
-        pyro.load_gk_output()
-        data = pyro.gk_output.data
-        growth_rates.append((list(data['growth_rate'].values[0])[0]))
-        frequencies.append((list(data['mode_frequency'].values[0])[0]))
+        ky_dir = os.path.join(output_base_dir,param_dir, f"ky_{ky:.2f}","out.tglf.run")
+        with open(ky_dir, 'r') as file:
+            parts = file.readlines()[7].split(":")[1].strip().split()
+            growth_rates.append(float(parts[1]))
+            frequencies.append(-float(parts[0]))
 
     return [frequencies, growth_rates]
 
@@ -190,11 +197,11 @@ def read_gs2_files(template_path, ky_range):
 def run_TGLF(NBASIS_DIF, NBASIS_MIN, NXGRID, FILTER, WIDTH_DIF, WIDTH_MIN, THETA_TRAPPED):
     TGLF_data = []
     params_to_update = {
-        "NBASIS_MAX": NBASIS_DIF+NBASIS_MIN,
+        "NBASIS_MAX": NBASIS_DIF + NBASIS_MIN,
         "NBASIS_MIN": NBASIS_MIN,
         "NXGRID": NXGRID,
         "FILTER": FILTER,
-        "WIDTH": WIDTH_DIF+WIDTH_MIN,
+        "WIDTH": WIDTH_DIF + WIDTH_MIN,
         "WIDTH_MIN": WIDTH_MIN,
         "THETA_TRAPPED": THETA_TRAPPED,
     }
@@ -204,12 +211,12 @@ def run_TGLF(NBASIS_DIF, NBASIS_MIN, NXGRID, FILTER, WIDTH_DIF, WIDTH_MIN, THETA
         # Generate TGLF input files
         generate_tglf_files(simulation, params_to_update, KY_RANGE)
 
-        job_ids = job_ids + run_tglf_on_files_Compute(simulation,params_to_update)
+        job_ids = job_ids + run_tglf_on_files_Compute(simulation, params_to_update, KY_RANGE)
 
     # Wait for all jobs to complete
-
     print("Waiting for all TGLF jobs to complete...")
     total_jobs = len(job_ids)
+    spinner = itertools.cycle(["|", "/", "-", "\\"])  # Spinning wheel characters
 
     while True:
         # Check the status of the jobs using squeue
@@ -218,21 +225,36 @@ def run_TGLF(NBASIS_DIF, NBASIS_MIN, NXGRID, FILTER, WIDTH_DIF, WIDTH_MIN, THETA
         num_jobs_left = len(job_lines)  # Count the number of jobs left
         num_jobs_completed = total_jobs - num_jobs_left  # Calculate completed jobs
 
-        # Display the loading bar
+        # Display the loading bar with the spinning wheel
         progress = int((num_jobs_completed / total_jobs) * 50)  # Scale progress to 50 characters
         loading_bar = f"[{'#' * progress}{'.' * (50 - progress)}]"
-        sys.stdout.write(f"\r{loading_bar} {num_jobs_completed}/{total_jobs} jobs completed")
+        spin_char = next(spinner)  # Get the next character in the spinning wheel
+        sys.stdout.write(f"\r{loading_bar} {num_jobs_completed}/{total_jobs} jobs completed [{spin_char}]")
         sys.stdout.flush()
 
         if num_jobs_left == 0:  # If no jobs are listed, they are all complete
             break
 
-        time.sleep(10)  # Wait for 10 seconds before checking again
+        time.sleep(0.1)  # Wait for 0.1 seconds before updating again
 
     print("\nAll TGLF jobs have completed.")
 
+    # Verify that all output files exist before reading
+    print("Verifying TGLF output files...")
     for simulation in simulation_list:
-        TGLF_data.append(read_tglf_files(simulation,params_to_update, KY_RANGE))
+        param_dir = "_".join([f"{key}{value}" for key, value in params_to_update.items() if key != "KY"])
+        output_base_dir = os.path.join("TGLF/Simulations", simulation, param_dir)
+
+        for ky in KY_RANGE:
+            output_file = os.path.join(output_base_dir, f"ky_{ky:.2f}", "out.tglf.run")
+            while not os.path.exists(output_file):
+                print(f"Waiting for output file: {output_file}")
+                time.sleep(1)  # Wait for 1 second before checking again
+
+
+
+    for simulation in simulation_list:
+        TGLF_data.append(read_tglf_files(simulation, params_to_update, KY_RANGE))
 
     return TGLF_data
 
@@ -498,6 +520,33 @@ def create_markdown_report(TGLF_data, GS2_data, params):
 
     print(f"Markdown report saved as {output_file}")
 
+
+def plot_pairwise_bayesian_optimization(optimizer, output_file="Bayesian_Optimization_Results.pdf"):
+    """
+    Generate pairwise plots of the Bayesian optimization results and add them to the PDF.
+
+    Args:
+        optimizer (BayesianOptimization): The BayesianOptimization object after running the optimization.
+        output_file (str): Name of the output PDF file.
+    """
+    # Extract the results into a DataFrame
+    results = pd.DataFrame([{
+        **res["params"],  # Add parameter values
+        "target": res["target"]  # Add target value
+    } for res in optimizer.res])
+
+    # Create pairwise plots
+    pairplot = sns.pairplot(results, diag_kind="kde", corner=True, plot_kws={"s": 10}, diag_kws={"shade": True})
+    pairplot.fig.suptitle("Pairwise Parameter Relationships", y=1.02, fontsize=16)
+
+    # Add the plot to the PDF
+    with PdfPages(output_file) as pdf:
+        pdf.savefig(pairplot.fig)
+        plt.close(pairplot.fig)
+
+    print(f"Pairwise plots added to {output_file}")
+
+
 def plot_bayesian_optimization_results(optimizer, output_file="Bayesian_Optimization_Results.pdf"):
     """
     Plot the results of the Bayesian optimization process and save them to a PDF.
@@ -541,6 +590,9 @@ def plot_bayesian_optimization_results(optimizer, output_file="Bayesian_Optimiza
 
         pdf.savefig(fig)
         plt.close(fig)
+
+    # Add pairwise plots to the PDF
+    plot_pairwise_bayesian_optimization(optimizer, output_file)
 
     print(f"PDF report saved as {output_file}")
 
